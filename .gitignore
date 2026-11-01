@@ -1,0 +1,4 @@
+# code only -- datasets, archives, videos and caches stay local
+*
+!*.py
+!.gitignore
