@@ -450,11 +450,15 @@ def run_record(args) -> bool:
 # ---------------------------------------------------------------------------
 
 class Annotator:
-    def __init__(self, dataset_dir: str, records: list, annotations: dict, model: ClevisModel):
+    def __init__(self, dataset_dir: str, records: list, annotations: dict, model: ClevisModel,
+                 reference=None):
+        # reference: optional callable record -> (uint8 0/1 mask, label) shown in the right panel instead of
+        # the GT clevis silhouette (e.g. an automatically generated mask to compare the drawing with)
         self.dataset_dir = dataset_dir
         self.records = records
         self.annotations = annotations
         self.model = model
+        self.reference = reference
         os.makedirs(os.path.join(dataset_dir, MASK_SUBDIR), exist_ok=True)
 
         self.mode = 'polygon'
@@ -497,10 +501,15 @@ class Annotator:
         if entry.get('mask'):
             mask = cv2.imread(os.path.join(self.dataset_dir, entry['mask']), cv2.IMREAD_GRAYSCALE)
         self.mask = (mask > 127).astype(numpy.uint8) * 255 if mask is not None else numpy.zeros((h, w), numpy.uint8)
-        cam_T_clevis = cam_T_joint_model(numpy.array(record['cam_T_shaft_end'], dtype=numpy.float64),
-                                         numpy.array(record['cam_T_gripper'], dtype=numpy.float64))
-        K = numpy.array(record['camera_matrix_right_rect'], dtype=numpy.float64)
-        self.gt_mask = (render_silhouette(self.model, cam_T_clevis, K, (w, h)) > 127).astype(numpy.uint8)
+        if self.reference is not None:
+            ref, self.reference_label = self.reference(record)
+            self.gt_mask = (numpy.asarray(ref) > 0).astype(numpy.uint8)
+        else:
+            cam_T_clevis = cam_T_joint_model(numpy.array(record['cam_T_shaft_end'], dtype=numpy.float64),
+                                             numpy.array(record['cam_T_gripper'], dtype=numpy.float64))
+            K = numpy.array(record['camera_matrix_right_rect'], dtype=numpy.float64)
+            self.gt_mask = (render_silhouette(self.model, cam_T_clevis, K, (w, h)) > 127).astype(numpy.uint8)
+            self.reference_label = 'Ground truth: hand-eye + 3D pose alignment (clevis silhouette)'
         self.history = []
         self.polygon = []
         self.dirty = False
@@ -646,7 +655,7 @@ class Annotator:
         contours, _ = cv2.findContours(self.gt_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
         for c in contours:
             cv2.polylines(gt_canvas, [to_canvas(c)], True, GT_COLOR, 2, cv2.LINE_AA)
-        label = 'Ground truth: hand-eye + 3D pose alignment (clevis silhouette)'
+        label = self.reference_label
         if not sel.any():
             label += ' -- OFF-IMAGE'
         cv2.putText(gt_canvas, label, (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 5, cv2.LINE_AA)
