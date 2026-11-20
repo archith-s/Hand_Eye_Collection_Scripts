@@ -55,11 +55,8 @@ import sys
 import time
 
 import cv2
-import cv_bridge
 import geometry_msgs.msg
-import message_filters
 import numpy
-import sensor_msgs.msg
 import yaml
 from scipy.spatial.transform import Rotation
 
@@ -67,6 +64,7 @@ import crtk
 import dvrk_camera_registration
 
 from hand_eye_rodrigues_dataset import camera_info_record, kdl_pose_record, pose_record
+import stereo_video_capture as svc
 
 RIG = os.environ.get('RIG', 'jhu_dVRK')  # falls back if $RIG isn't set
 
@@ -75,9 +73,13 @@ LIVE_WINDOW_NAME = 'Ground truth capture (live)'
 # camera_registration.py always writes PSM1's hand-eye calibration here
 DEFAULT_HAND_EYE_JSON = os.path.expanduser('~/PSM1-registration-open-cv.json')
 
-# output_path of stereo_camera_calibration_archits_charuco_board.sh
+# output_path of stereo_camera_calibration_archits_charuco_board.sh. The
+# _lr_fixed run is the same ChArUco images with left/right relabelled to the
+# physical eyes (DeckLink device 0 = left, 1 = right; see
+# start_video_source.sh); the older results_with_full_dist_dvrk_classic had
+# the eyes swapped (T[0] > 0) and only matches datasets recorded before the fix.
 DEFAULT_STEREO_CALIB_DIR = os.path.expanduser(
-    '~/OpencvCameraCalibration/output/charuco-test-dataset/results_with_full_dist_dvrk_classic')
+    '~/OpencvCameraCalibration/output/charuco-test-dataset/results_with_full_dist_dvrk_classic_lr_fixed')
 
 VARIANTS_JSON_NAME = 'calibration_variants.json'
 PRIMARY_VARIANT = 'hand_eye_post_alignment'
@@ -233,7 +235,8 @@ def draw_axis(img, camera_matrix, dist_coeffs, pose, size=0.01):
 class GroundTruthCapture:
     def __init__(self, ral, arm_handle, calibration: dict, rectification: dict, out_dir: str, interval: float,
                  startup_delay: float = 5.0, automatic: bool = False, psm_name: str = 'PSM1',
-                 hand_eye_json: str = DEFAULT_HAND_EYE_JSON, max_pose_age: float = 1.0):
+                 hand_eye_json: str = DEFAULT_HAND_EYE_JSON, max_pose_age: float = 1.0,
+                 video_source: str = svc.DEFAULT_SOURCE_NAME):
         self.arm_handle = arm_handle
         self.calibration = calibration
         self.cam_T_base = calibration['post']  # raw right optical frame
@@ -248,7 +251,6 @@ class GroundTruthCapture:
         self.out_dir = out_dir
         self.interval = interval
         self.automatic = automatic
-        self._pending = None  # latest synced (left, right) raw messages
         self.startup_delay = startup_delay
         self.start_time = time.time()
         os.makedirs(self.out_dir, exist_ok=True)
@@ -265,50 +267,33 @@ class GroundTruthCapture:
         self.variant_records = self._load_existing_variant_records()
         self.last_save = 0.0
 
-        self.bridge = cv_bridge.CvBridge()
         # stereo-rectified right image: P's 3x3, zero distortion
         self.camera_matrix = rectification['camera_matrix_right_rect']
         self.dist_coeffs = numpy.zeros((5, 1))
 
-        left_topic = f'/{RIG}/left/image_raw'
-        right_topic = f'/{RIG}/right/image_raw'
+        # Raw left/right straight from the DeckLink cards
+        # (DecklinkVideoGstreamerClient) instead of /RIG/{left,right}/image_raw.
+        self.capture = svc.StereoVideoCapture(video_source)
         # camera_info is only recorded (and compared against the stereo
         # calibration's K) -- everything is projected with the stereo
-        # rectification loaded above, not with these.
-        right_info_topic = f'/{RIG}/right/camera_info'
-        left_info_topic = f'/{RIG}/left/camera_info'
-        print(f'Subscribing to {left_topic}, {right_topic}, {right_info_topic}, {left_info_topic}')
+        # rectification loaded above, not with these. Same dvrk_video yamls
+        # gscam used to publish on /RIG/{left,right}/camera_info.
+        for side in ('left', 'right'):
+            path = svc.calibration_yaml_path(side, RIG)
+            self.latest_camera_info[side] = svc.load_camera_info(side, RIG, path)
+            print(f'{side} camera_info from {path}')
         print(f'Stereo rectification from {rectification["calib_dir"]}')
         for name, topic in self.pose_topics.items():
             print(f'Subscribing to {topic} ({name})')
         print(f'Saving pairs + gripper ground truth to ./{self.out_dir}/ '
               f'(+ {VARIANTS_JSON_NAME}: kinematic / pre / post-alignment poses)')
 
-        # crtk.ral has no public accessor for its underlying rclpy node,
-        # but message_filters needs a real node to subscribe on.
+        # crtk.ral has no public accessor for its underlying rclpy node
         node = ral._node
-        node.create_subscription(
-            sensor_msgs.msg.CameraInfo, right_info_topic, self._info_callback, 10
-        )
-        node.create_subscription(
-            sensor_msgs.msg.CameraInfo, left_info_topic, self._left_info_callback, 10
-        )
         for name, topic in self.pose_topics.items():
             node.create_subscription(
                 geometry_msgs.msg.PoseStamped, topic, self._pose_callback(name), 10
             )
-        left_sub = message_filters.Subscriber(node, sensor_msgs.msg.Image, left_topic)
-        right_sub = message_filters.Subscriber(node, sensor_msgs.msg.Image, right_topic)
-        self.ts = message_filters.ApproximateTimeSynchronizer(
-            [left_sub, right_sub], queue_size=10, slop=0.1
-        )
-        self.ts.registerCallback(self.callback)
-
-    def _info_callback(self, info_msg):
-        self.latest_camera_info['right'] = info_msg
-
-    def _left_info_callback(self, info_msg):
-        self.latest_camera_info['left'] = info_msg
 
     def _pose_callback(self, name):
         def cb(msg):
@@ -401,21 +386,15 @@ class GroundTruthCapture:
             'shaft_end_pixel_right_rect': project_origin(self.camera_matrix, cam_T_shaft_end),
         }
 
-    def callback(self, left_msg, right_msg):
-        # Keep this cheap -- runs on crtk's single-threaded executor. Capture
-        # (which needs a blocking forward_kinematics call, only safe from the
-        # main thread) happens in try_capture(), called from main()'s loop.
-        self._pending = (left_msg, right_msg)
-
     def automatic_capture_due(self) -> bool:
         return self.automatic and time.time() - self.last_save >= self.interval
 
     def update_live(self):
         # Assumes the caller has already created LIVE_WINDOW_NAME.
-        if self._pending is None:
+        frame = self.capture.latest()
+        if frame is None:
             return
-        img = rectify(self.rectification, 'right',
-                      self.bridge.imgmsg_to_cv2(self._pending[1], desired_encoding='bgr8'))
+        img = rectify(self.rectification, 'right', frame.right)
 
         now = time.time()
         mode = f'automatic every {self.interval:.1f}s' if self.automatic else '[c]apture'
@@ -434,10 +413,10 @@ class GroundTruthCapture:
         cv2.imshow(LIVE_WINDOW_NAME, img)
 
     def try_capture(self) -> bool:
-        if self._pending is None:
-            print('No synced frame available yet.')
+        frame = self.capture.latest()
+        if frame is None:
+            print('No (fresh) stereo frame available yet -- is ./start_video_source.sh running?')
             return False
-        left_msg, right_msg = self._pending
         now = time.time()
         if now - self.start_time < self.startup_delay:
             if not self.automatic:
@@ -464,8 +443,8 @@ class GroundTruthCapture:
 
         self.last_save = now
 
-        left_img = self.bridge.imgmsg_to_cv2(left_msg, desired_encoding='bgr8')
-        right_img = self.bridge.imgmsg_to_cv2(right_msg, desired_encoding='bgr8')
+        left_img = frame.left
+        right_img = frame.right
         left_rect_img = rectify(self.rectification, 'left', left_img)
         right_rect_img = rectify(self.rectification, 'right', right_img)
 
@@ -648,6 +627,10 @@ def main():
         '--startup-delay', type=float, default=5.0,
         help='seconds to wait after connecting before saving the first frame',
     )
+    parser.add_argument(
+        '--video-source', type=str, default=svc.DEFAULT_SOURCE_NAME,
+        help='name of the running DecklinkVideoGstreamerClient video_source (-n), see start_video_source.sh',
+    )
     args = parser.parse_args(argv)
 
     ral = crtk.ral('image_generation_gt_hand_eye')
@@ -667,7 +650,8 @@ def main():
 
     capture = GroundTruthCapture(ral, arm_handle, calibration, rectification, args.output_dir, args.interval,
                                  args.startup_delay, automatic=args.automatic, psm_name=args.psm_name,
-                                 hand_eye_json=args.hand_eye_json, max_pose_age=args.max_pose_age)
+                                 hand_eye_json=args.hand_eye_json, max_pose_age=args.max_pose_age,
+                                 video_source=args.video_source)
 
     print(f'Waiting for synced image pairs... (capture starts in {args.startup_delay:.0f}s)')
     if args.automatic:
@@ -691,6 +675,7 @@ def main():
     cv2.destroyWindow(LIVE_WINDOW_NAME)
 
     print(f'Captured {capture.count} frame(s) in ./{args.output_dir}/')
+    capture.capture.close()
     ral.shutdown()
 
 

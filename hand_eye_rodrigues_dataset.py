@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 
 # Captures a small dataset (default 20 frames) of synced left/right/rectified
-# images together with PSM1/ECM/SUJ raw poses -- same rostopics and PSM1 crtk
-# calls as hand_eye_gt_raw.py -- then walks through the captured frames in a
-# manual alignment pass to also record a manually-aligned 6D pose in the
+# images together with PSM1/ECM/SUJ raw poses -- same pose rostopics and PSM1
+# crtk calls as hand_eye_gt_raw.py -- then walks through the captured frames
+# in a manual alignment pass to also record a manually-aligned 6D pose in the
 # camera frame for each one.
+#
+# Images come straight from the DeckLink cards through
+# DecklinkVideoGstreamerClient (run ./start_video_source.sh first, instead of
+# the dvrk_video gscam launch); see stereo_video_capture.py.
 #
 # Two phases, run back-to-back in one sitting by default:
 #
@@ -51,15 +55,15 @@ import sys
 import time
 
 import cv2
-import cv_bridge
 import geometry_msgs.msg
-import message_filters
 import numpy
 import sensor_msgs.msg
 from scipy.spatial.transform import Rotation
 
 import crtk
 import dvrk_camera_registration
+
+import stereo_video_capture as svc
 
 RIG = os.environ.get('RIG', 'jhu_dVRK')  # falls back if $RIG isn't set
 
@@ -398,7 +402,8 @@ def maybe_apply_hand_eye_correction(hand_eye_json: str, cam_T_base_at_capture: n
 class RawCapture:
     def __init__(self, node, arm_handle, cam_T_base: numpy.ndarray, out_dir: str, num_frames: int,
                  startup_delay: float, max_pose_age: float,
-                 marker_size: float, jaw_length_m: float, jaw_half_angle_deg: float, jaw_half_width_m: float):
+                 marker_size: float, jaw_length_m: float, jaw_half_angle_deg: float, jaw_half_width_m: float,
+                 video_source: str = svc.DEFAULT_SOURCE_NAME):
         self.node = node
         self.arm_handle = arm_handle
         self.cam_T_base = cam_T_base
@@ -425,45 +430,32 @@ class RawCapture:
         self.meta = data.get('meta', {})
         self.count = len(self.records)
 
-        self.bridge = cv_bridge.CvBridge()
         self.dist_coeffs = numpy.zeros((5, 1))
 
         self.latest_pose = {}
         self.latest_camera_info = {}
         self.camera_matrix = None
-        self._pending = None  # latest synced (left, right, right_rect) image triple
 
-        left_topic = f'/{RIG}/left/image_raw'
-        right_topic = f'/{RIG}/right/image_raw'
-        right_rect_topic = f'/{RIG}/right/image_rect'
-        left_info_topic = f'/{RIG}/left/camera_info'
-        right_info_topic = f'/{RIG}/right/camera_info'
+        # Images straight from the DeckLink cards (DecklinkVideoGstreamerClient)
+        # instead of /RIG/{left,right}/image_raw + right/image_rect; camera_info
+        # from the same dvrk_video yamls gscam published, and right_rect made
+        # with the same maps image_proc's rectify node used.
+        self.capture = svc.StereoVideoCapture(video_source)
+        for side in ('left', 'right'):
+            path = svc.calibration_yaml_path(side, RIG)
+            self._info_callback(side)(svc.load_camera_info(side, RIG, path))
+            print(f'{side} camera_info from {path}')
+        self.rectify_right = svc.CameraInfoRectifier(self.latest_camera_info['right'][0])
 
-        print(f'Subscribing to {left_topic}, {right_topic}, {right_rect_topic}')
-        print(f'Subscribing to {left_info_topic}, {right_info_topic}')
         for name, topic in POSE_TOPICS.items():
             print(f'Subscribing to {topic} ({name})')
         print(f'Using PSM1 crtk handle for {GRIPPER_POSE_NAME} and {SHAFT_POSE_NAME} (forward kinematics)')
         print(f'Saving dataset to ./{self.out_dir}/ ({self.count}/{self.num_frames} frames already captured)')
 
-        self.node.create_subscription(
-            sensor_msgs.msg.CameraInfo, left_info_topic, self._info_callback('left'), 10
-        )
-        self.node.create_subscription(
-            sensor_msgs.msg.CameraInfo, right_info_topic, self._info_callback('right'), 10
-        )
         for name, topic in POSE_TOPICS.items():
             self.node.create_subscription(
                 geometry_msgs.msg.PoseStamped, topic, self._pose_callback(name), 10
             )
-
-        left_sub = message_filters.Subscriber(self.node, sensor_msgs.msg.Image, left_topic)
-        right_sub = message_filters.Subscriber(self.node, sensor_msgs.msg.Image, right_topic)
-        right_rect_sub = message_filters.Subscriber(self.node, sensor_msgs.msg.Image, right_rect_topic)
-        self.ts = message_filters.ApproximateTimeSynchronizer(
-            [left_sub, right_sub, right_rect_sub], queue_size=10, slop=0.1
-        )
-        self.ts.registerCallback(self._image_callback)
 
     # -- subscriptions --------------------------------------------------
 
@@ -479,12 +471,6 @@ class RawCapture:
         def cb(msg):
             self.latest_pose[name] = (msg, time.time())
         return cb
-
-    def _image_callback(self, left_msg, right_msg, right_rect_msg):
-        # Keep this cheap -- runs on crtk's single-threaded executor. Capture
-        # (which needs a blocking forward_kinematics call, only safe from the
-        # main thread) happens in try_capture() below, not here.
-        self._pending = (left_msg, right_msg, right_rect_msg)
 
     # -- persistence ------------------------------------------------------
 
@@ -527,10 +513,10 @@ class RawCapture:
 
     def update_live(self):
         # Assumes the caller has already created LIVE_WINDOW_NAME.
-        if self._pending is None:
+        frame = self.capture.latest()
+        if frame is None:
             return
-        _left_msg, _right_msg, right_rect_msg = self._pending
-        img = self.bridge.imgmsg_to_cv2(right_rect_msg, desired_encoding='bgr8').copy()
+        img = self.rectify_right(frame.right)
 
         now = time.time()
         lines = [f'Captured {self.count}/{self.num_frames}  --  [c]apture  [q]uit & align  [ESC]abort']
@@ -547,8 +533,9 @@ class RawCapture:
         cv2.imshow(LIVE_WINDOW_NAME, img)
 
     def try_capture(self) -> bool:
-        if self._pending is None:
-            print('No synced frame available yet.')
+        frame = self.capture.latest()
+        if frame is None:
+            print('No (fresh) stereo frame available yet -- is ./start_video_source.sh running?')
             return False
         now = time.time()
         if now - self.start_time < self.startup_delay:
@@ -562,7 +549,6 @@ class RawCapture:
             print(f'Cannot capture, missing/stale data: {", ".join(missing)}')
             return False
 
-        left_msg, right_msg, right_rect_msg = self._pending
         try:
             psm1_cp, _ = self.arm_handle.measured_cp()
             psm1_local_cp, _ = self.arm_handle.local.measured_cp()
@@ -586,9 +572,9 @@ class RawCapture:
         cam_T_shaft_end_nominal = self.cam_T_base @ base_T_shaft_end
 
         idx = self.count
-        left_img = self.bridge.imgmsg_to_cv2(left_msg, desired_encoding='bgr8')
-        right_img = self.bridge.imgmsg_to_cv2(right_msg, desired_encoding='bgr8')
-        right_rect_img = self.bridge.imgmsg_to_cv2(right_rect_msg, desired_encoding='bgr8')
+        left_img = frame.left
+        right_img = frame.right
+        right_rect_img = self.rectify_right(right_img)
 
         lfname = f'left-{idx:04d}.png'
         rfname = f'right-{idx:04d}.png'
@@ -985,6 +971,10 @@ def main():
         '--jaw-width-mm', type=float, default=4.0,
         help='width of the drawn jaw blades and the shaft-point pivot ring, in mm (default: 4mm)',
     )
+    parser.add_argument(
+        '--video-source', type=str, default=svc.DEFAULT_SOURCE_NAME,
+        help='name of the running DecklinkVideoGstreamerClient video_source (-n), see start_video_source.sh',
+    )
 
     if '--align-only' in sys.argv[1:]:
         args = parser.parse_args(sys.argv[1:])
@@ -1024,6 +1014,7 @@ def main():
     capture = RawCapture(
         ral._node, arm_handle, cam_T_base, args.output_dir, args.num_frames,
         args.startup_delay, args.max_pose_age, args.marker_size, jaw_length_m, args.jaw_angle_deg, jaw_half_width_m,
+        video_source=args.video_source,
     )
 
     if capture.is_done():
@@ -1058,6 +1049,7 @@ def main():
         cv2.destroyWindow(LIVE_WINDOW_NAME)
 
     print(f'Captured {capture.count}/{capture.num_frames} frames.')
+    capture.capture.close()
     ral.shutdown()
 
     if aborted:

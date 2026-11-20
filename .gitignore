@@ -2,3 +2,4 @@
 *
 !*.py
 !.gitignore
+!start_video_source.sh

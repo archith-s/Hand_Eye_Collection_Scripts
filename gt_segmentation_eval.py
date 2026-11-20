@@ -40,9 +40,9 @@
 #      the segmentation (what the IoU is) and the GT vs best-fit outlines
 #      (what the errors are).
 #
-# Once the PDF is written and every frame is segmented or skipped, the
-# images, masks and intermediate JSON are deleted, leaving only the PDF
-# (for a dataset recorded by another script, only the masks are deleted).
+#      The per-frame numbers are also written to segmentation_eval.json.
+#      Everything the run creates (images, GT JSON, masks, annotations) is
+#      kept alongside the PDF.
 #
 # --annotate-only skips phase 1 (segment + evaluate an existing dataset,
 # e.g. one recorded by image_generation_gt_hand_eye.py), --evaluate-only
@@ -51,7 +51,6 @@
 import argparse
 import json
 import os
-import shutil
 import struct
 import sys
 import time
@@ -69,6 +68,7 @@ RECORDED_BY = 'gt_segmentation_eval.py'
 ANNOTATIONS_JSON_NAME = 'segmentation_annotations.json'
 MASK_SUBDIR = 'masks'
 EVAL_PDF_NAME = 'segmentation_eval.pdf'
+EVAL_JSON_NAME = 'segmentation_eval.json'
 
 REGION = 'clevis'
 INSTRUCTION = ('Draw the CLEVIS only: the wrist link from the first (pitch) pin to the jaw pin. '
@@ -320,27 +320,6 @@ def save_annotations(dataset_dir: str, annotations: dict):
         json.dump(annotations, f, indent=2)
 
 
-def cleanup(dataset_dir: str, records: list, annotations: dict):
-    frames = annotations['frames']
-    pending = [r['frame_index'] for r in records
-               if frames.get(str(r['frame_index']), {}).get('status') not in ('saved', 'skipped')]
-    if pending:
-        print(f'Frame(s) {pending} not segmented yet -- keeping the images; finish with --annotate-only '
-              f'and they are removed after that run.')
-        return
-    shutil.rmtree(os.path.join(dataset_dir, MASK_SUBDIR), ignore_errors=True)
-    os.remove(os.path.join(dataset_dir, ANNOTATIONS_JSON_NAME))
-    if all(r.get('recorded_by') == RECORDED_BY for r in records):
-        for r in records:
-            path = os.path.join(dataset_dir, r['right_rect_image'])
-            if os.path.exists(path):
-                os.remove(path)
-        os.remove(os.path.join(dataset_dir, GT_JSON_NAME))
-        print(f'Removed the images, masks and intermediate JSON -- only {EVAL_PDF_NAME} is left.')
-    else:
-        print('Removed the masks. This dataset was recorded by another script, so its own images were left.')
-
-
 # ---------------------------------------------------------------------------
 # phase 1: record
 # ---------------------------------------------------------------------------
@@ -348,10 +327,9 @@ def cleanup(dataset_dir: str, records: list, annotations: dict):
 def run_record(args) -> bool:
     # imported here so segment/evaluate work without ROS
     import crtk
-    import cv_bridge
     import dvrk_camera_registration
-    import sensor_msgs.msg
     import image_generation_gt_hand_eye as gt
+    import stereo_video_capture as svc
 
     calibration = gt.load_calibration_variants(args.hand_eye_json)
     if not calibration['alignment_applied']:
@@ -381,17 +359,15 @@ def run_record(args) -> bool:
     ral.spin()
     ral.check_connections()
 
-    bridge = cv_bridge.CvBridge()
-    latest = {}
-    image_topic = f'/{gt.RIG}/right/image_raw'
-    print(f'Subscribing to {image_topic}')
-    ral._node.create_subscription(sensor_msgs.msg.Image, image_topic,
-                                  lambda msg: latest.__setitem__('right', msg), 10)
+    # right raw image straight from the DeckLink cards (DecklinkVideoGstreamerClient,
+    # run ./start_video_source.sh first) instead of /RIG/right/image_raw
+    video = svc.StereoVideoCapture(args.video_source)
     start_time = time.time()
 
     def capture():
-        if 'right' not in latest:
-            print('No image received yet.')
+        frame = video.latest()
+        if frame is None:
+            print('No (fresh) image available yet -- is ./start_video_source.sh running?')
             return
         if time.time() - start_time < args.startup_delay:
             print('Still within startup delay.')
@@ -403,7 +379,7 @@ def run_record(args) -> bool:
         except TimeoutError as e:
             print(f'Cannot capture, PSM pose not available: {e}')
             return
-        image = gt.rectify(rectification, 'right', bridge.imgmsg_to_cv2(latest['right'], desired_encoding='bgr8'))
+        image = gt.rectify(rectification, 'right', frame.right)
         idx = len(records)
         fname = f'right_rect-{idx:04d}.png'
         cv2.imwrite(os.path.join(args.output_dir, fname), image)
@@ -425,9 +401,9 @@ def run_record(args) -> bool:
     cv2.namedWindow(LIVE_WINDOW_NAME, cv2.WINDOW_NORMAL)
     try:
         while not ral.is_shutdown():
-            if 'right' in latest:
-                img = gt.rectify(rectification, 'right',
-                                 bridge.imgmsg_to_cv2(latest['right'], desired_encoding='bgr8'))
+            frame = video.latest()
+            if frame is not None:
+                img = gt.rectify(rectification, 'right', frame.right)
                 line = f'Captured {len(records)}  --  [c]apture  [q/ESC] finish'
                 cv2.putText(img, line, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
                 cv2.putText(img, line, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
@@ -441,6 +417,7 @@ def run_record(args) -> bool:
         pass
     cv2.destroyWindow(LIVE_WINDOW_NAME)
     print(f'Captured {len(records)} frame(s) in ./{args.output_dir}/')
+    video.close()
     ral.shutdown()
     return len(records) > 0
 
@@ -937,6 +914,10 @@ def run_evaluate(args, records, annotations) -> bool:
     pdf_path = os.path.join(args.output_dir, EVAL_PDF_NAME)
     write_pdf(pdf_path, meta_lines, results, pages)
     print(f'Saved {pdf_path}')
+    json_path = os.path.join(args.output_dir, EVAL_JSON_NAME)
+    with open(json_path, 'w') as f:
+        json.dump({'meta': meta_lines, 'results': results}, f, indent=2, default=float)
+    print(f'Saved {json_path}')
     return True
 
 
@@ -955,6 +936,9 @@ def main():
                         help='skip recording and segmenting: just evaluate the existing masks')
     # record
     parser.add_argument('-p', '--psm-name', type=str, default='PSM1', choices=['PSM1', 'PSM2', 'PSM3'])
+    parser.add_argument('--video-source', type=str, default='camera',
+                        help='name of the running DecklinkVideoGstreamerClient video_source (-n), '
+                             'see start_video_source.sh')
     parser.add_argument('-H', '--hand-eye-json', type=str, default=DEFAULT_HAND_EYE_JSON,
                         help=f'hand-eye calibration (with the GUI alignment applied) used as ground truth '
                              f'when recording (default: {DEFAULT_HAND_EYE_JSON})')
@@ -985,8 +969,7 @@ def main():
         save_annotations(args.output_dir, annotations)
         Annotator(args.output_dir, records, annotations, ClevisModel(args.clevis_stl)).run()
 
-    if run_evaluate(args, records, annotations):
-        cleanup(args.output_dir, records, annotations)
+    run_evaluate(args, records, annotations)
 
 
 if __name__ == '__main__':
